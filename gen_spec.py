@@ -52,23 +52,36 @@ def extract_deb_scripts(deb_path: str) -> dict:
 
 
 def parse_version(version_str: str) -> tuple:
+    if ":" in version_str:
+        version_str = version_str.split(":", 1)[1]
+    release = "1"
+    if "-" in version_str:
+        parts = version_str.rsplit("-", 1)
+        if len(parts) == 2:
+            version_str = parts[0]
+            release = parts[1]
+    elif "+" in version_str:
+        parts = version_str.rsplit("+", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            version_str = parts[0]
+            release = parts[1]
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_str)
     if match:
-        return match.groups()
+        return (*match.groups(), release)
     match = re.match(r"(\d+)\.(\d+)", version_str)
     if match:
-        return (*match.groups(), "0")
-    return ("0", "0", "0")
+        return (*match.groups(), "0", release)
+    return ("0", "0", "0", release)
 
 
 def generate_spec(control: dict, scripts: dict, output: str, deb_filename: str = ""):
     name = control.get("Package", "lm-studio")
     version = control.get("Version", "0.0.0")
-    major, minor, patch = parse_version(version)
+    major, minor, patch, release = parse_version(version)
     description = control.get("Description", "No description available")
     maintainer = control.get("Maintainer", "Unknown")
 
-    version_release = f"{major}.{minor}.{patch}-1"
+    version_release = f"{major}.{minor}.{patch}-{release}"
     changelog_date = subprocess.run(
         ["date", "+%a %b %d %Y"], capture_output=True, text=True
     ).stdout.strip()
@@ -106,7 +119,7 @@ fi
 
     spec_content = f"""Name: {name}
 Version: {major}.{minor}.{patch}
-Release: 1
+Release: {release}
 {extra_defines}{source_line}Summary: {control.get("Description", "").split(chr(10))[0] or "No summary"}
 License: see /usr/share/doc/{name}/copyright
 Vendor: {maintainer}
