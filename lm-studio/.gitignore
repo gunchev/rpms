@@ -1,6 +1,7 @@
 # Build artifacts
 *.rpm
 *.spec
+*.deb
 /rpms/
 
 # Debian packages
