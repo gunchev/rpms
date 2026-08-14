@@ -1,0 +1,21 @@
+# Build artifacts
+*.rpm
+*.spec
+/rpms/
+
+# Debian packages
+*.deb
+
+# Build directories
+unsloth/
+unsloth-buildroot/
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
