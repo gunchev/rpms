@@ -69,7 +69,7 @@ rpmbuild -bb --target x86_64 --define "_sourcedir $(pwd)" unsloth.spec
 
 | Variable | Description | Default |
 |----------|--------------|---------|
-| `DEB` | Path to deb package | First `Unsloth-Desktop-*-Ubuntu.deb` found |
+| `DEB` | Path to deb package | `Unsloth-Desktop-Ubuntu.deb`, then first legacy `Unsloth-Desktop-*-Ubuntu.deb` |
 | `SPEC` | Output spec file | `unsloth.spec` |
 | `RPM_DIR` | RPM output directory | `./rpms/` |
 | `BUILD_ROOT` | Build root directory | `unsloth-buildroot` |
@@ -106,6 +106,57 @@ derives things from the deb's actual contents instead:
 When adapting this project for a *different* package in the future, expect
 to mainly touch `DEB_TO_RPM_DEPS` and `STANDARD_DIRS`; the rest should
 already be generic enough to handle a different file layout.
+
+Current releases use the unversioned filename `Unsloth-Desktop-Ubuntu.deb`.
+Make and the generator prefer that name, with a fallback to legacy
+`Unsloth-Desktop-*-Ubuntu.deb` names. The RPM version comes from the deb's
+control metadata. Download the full asset each time: resuming an older
+release under the same filename can retain stale data. `make all` finishes
+the download before invoking the build so `make -j all` also discovers the
+new file and generates the spec before source verification.
+
+## Desktop launch fix (Wayland + NVIDIA)
+
+`desktop_env_fix()` (`gen_spec.py`) injects `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+into the `Exec=` line of every desktop file the deb ships, during `%install`.
+Without it the app is killed on launch on a Wayland session with the
+proprietary NVIDIA driver:
+
+```
+wl_display#1.error(wp_linux_drm_syncobj_surface_v1#45, 4,
+                  "explicit sync is used, but no acquire point is set")
+Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.
+```
+
+NVIDIA's `egl-wayland2` arms explicit sync as soon as the EGL surface exists;
+GTK then attaches a buffer with no acquire point; strict compositors (KWin)
+enforce the protocol rule and drop the connection. Disabling the DMA-BUF
+renderer falls back to shared-memory presentation, which renders correctly —
+the cost is one `memcpy` per frame instead of zero-copy.
+
+Three things to know before touching this:
+
+- **`env` is required.** The Desktop Entry spec treats the first `Exec=`
+  token as the executable, so `Exec=VAR=value cmd` is not portable across
+  launchers. `Exec=env VAR=value cmd` is.
+- **Do NOT swap in `__NV_DISABLE_EXPLICIT_SYNC=1`.** It is the upstream-
+  recommended "keep zero-copy" fix for this exact error string, and it does
+  silence the protocol error — process alive, `WebKitWebProcess` burning
+  CPU, window mapped — but the content never paints: **solid black**.
+  Verified on Fedora 44 KDE Plasma + NVIDIA 615.71.09, 2026-10-07.
+  "No protocol error in the log" is not proof of a working render.
+- **The sed is POSIX ERE, not Python regex.** `sed -E` has no `(?:...)`
+  non-capturing group. `DESKTOP_EXEC_SED` is a plain string for exactly
+  that reason; don't "tidy" it into `re.compile`.
+
+The rewrite is idempotent and normalising: an existing `env` prefix or an
+absolute `/usr/bin/` path is folded into the canonical form rather than
+stacked, and unrelated `Exec=` lines are left alone. The generated `%install`
+grep-verifies the patch and **fails the build** rather than shipping an
+unpatched desktop file if upstream ever changes the `Exec=` shape.
+
+Caveat: this covers launcher/desktop launches only. Running `unsloth-studio`
+from a terminal still needs the env var set in the shell.
 
 ### Testing Individual Functions
 

@@ -25,14 +25,20 @@ make all          # Download, generate spec, and build RPM using mock
 
 Download the current release deb manually from the
 [Unsloth releases page](https://github.com/unslothai/unsloth/releases)
-(see `Unsloth-Desktop-*-Ubuntu.url` for the last-used link), or let
-`make download` fetch the latest one from the GitHub API.
+or let `make download` fetch the latest one from the GitHub API.
+
+Current releases use `Unsloth-Desktop-Ubuntu.deb` without a version in the
+filename. Both Make and `./gen_spec.py` prefer that file and fall back to
+legacy `Unsloth-Desktop-*-Ubuntu.deb` names. The RPM version is read from
+the Debian package's `Version` field. `make download` replaces the local
+file after a successful download so successive releases with the same
+filename are updated correctly.
 
 ## Variables
 
 | Variable | Description | Default |
 |----------|--------------|---------|
-| `DEB` | Path to deb package | First `Unsloth-Desktop-*-Ubuntu.deb` found |
+| `DEB` | Path to deb package | `Unsloth-Desktop-Ubuntu.deb`, then first legacy `Unsloth-Desktop-*-Ubuntu.deb` |
 | `SPEC` | Output spec file | `unsloth.spec` |
 | `RPM_DIR` | RPM output directory | `./rpms/` |
 

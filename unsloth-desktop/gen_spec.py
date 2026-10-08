@@ -34,9 +34,36 @@ STANDARD_DIRS = {
     "usr/share/doc",
     "usr/share/mime",
     "usr/share/mime/packages",
+    "usr/share/polkit-1",
+    "usr/share/polkit-1/actions",
 }
 HICOLOR_DIR_RE = re.compile(r"^usr/share/icons/hicolor(/.*)?$")
 SPDX_RE = re.compile(r"SPDX-License-Identifier:\s*(\S+)")
+
+# Executable token to rewrite in the desktop file's Exec= line.
+DESKTOP_EXEC = "unsloth-studio"
+
+# Wayland + NVIDIA: WebKitGTK's DMA-BUF renderer attaches a surface with no
+# acquire point, and strict compositors (KWin) kill the client with
+#   wp_linux_drm_syncobj_surface_v1 error 4:
+#     "explicit sync is used, but no acquire point is set"
+# Disabling the DMA-BUF renderer falls back to shared-memory presentation,
+# which renders correctly; the cost is one memcpy per frame instead of
+# zero-copy. `env` is required because the Desktop Entry spec treats the
+# first Exec= token as the executable, so `Exec=VAR=value cmd` is not
+# portable across launchers.
+#
+# Do NOT substitute __NV_DISABLE_EXPLICIT_SYNC=1. It is the upstream-
+# recommended "keep zero-copy" fix for this exact error string and it does
+# silence the protocol error -- process stays alive, WebKitWebProcess burns
+# CPU, window is mapped -- but the content never paints: solid black.
+# Verified on Fedora 44 KDE Plasma + NVIDIA 615.71.09, 2026-10-07.
+DESKTOP_ENV_FIX = "WEBKIT_DISABLE_DMABUF_RENDERER=1"
+
+# POSIX ERE (NOT Python regex -- sed -E has no `(?:...)` non-capturing group)
+# matching the Exec= line whether or not an env prefix / absolute path is
+# already present, so the rewrite normalises rather than stacks.
+DESKTOP_EXEC_SED = r"^Exec=(env [^ ]* )*(/usr/bin/)?" + DESKTOP_EXEC
 
 
 def extract_deb_control(deb_path: str) -> dict:
@@ -46,6 +73,7 @@ def extract_deb_control(deb_path: str) -> dict:
 
     result = subprocess.run(
         ["dpkg-deb", "--info", deb_path, "control"],
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -72,6 +100,7 @@ def extract_deb_scripts(deb_path: str) -> dict:
     for script in ["preinst", "postinst", "prerm", "postrm"]:
         result = subprocess.run(
             ["dpkg-deb", "--info", deb_path, script],
+            check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -85,6 +114,7 @@ def extract_deb_scripts(deb_path: str) -> dict:
 def extract_deb_contents(deb_path: str) -> list[tuple[str, str]]:
     result = subprocess.run(
         ["dpkg-deb", "--contents", deb_path],
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -112,6 +142,53 @@ def extract_deb_contents(deb_path: str) -> list[tuple[str, str]]:
 
 def toplevel_dirs(entries: list[tuple[str, str]]) -> list[str]:
     return sorted({path for kind, path in entries if kind == "d" and "/" not in path})
+
+
+def desktop_files(entries: list[tuple[str, str]]) -> list[str]:
+    """Desktop entry files shipped by the deb, layout-agnostic."""
+    return sorted(
+        {
+            path
+            for kind, path in entries
+            if kind == "f"
+            and path.startswith("usr/share/applications/")
+            and path.endswith(".desktop")
+        }
+    )
+
+
+def desktop_env_fix(entries: list[tuple[str, str]]) -> str:
+    """%install snippet injecting DESKTOP_ENV_FIX into the app's Exec= line.
+
+    Empty string when the deb ships no desktop file, so the generated spec
+    stays valid for a package layout that has none.
+    """
+    desktops = desktop_files(entries)
+    if not desktops:
+        return ""
+
+    targets = " ".join(f'"%{{buildroot}}/{path}"' for path in desktops)
+    pattern = DESKTOP_EXEC_SED
+    return f"""
+# Wayland + NVIDIA: WebKitGTK's DMA-BUF renderer submits a surface with no
+# acquire point and strict compositors (KWin) kill the client with
+#   wp_linux_drm_syncobj_surface_v1 error 4:
+#     "explicit sync is used, but no acquire point is set"
+# Shared-memory presentation renders correctly. `env` is required because
+# the Desktop Entry spec treats the first Exec= token as the executable.
+# Do NOT swap in __NV_DISABLE_EXPLICIT_SYNC=1 -- it hides the protocol
+# error but paints the window solid black (Fedora 44 KDE + NVIDIA
+# 615.71.09, verified 2026-10-07).
+for desktop in {targets}; do
+    if test -f "$desktop"; then
+        sed -i -E 's|{pattern}|Exec=env {DESKTOP_ENV_FIX} {DESKTOP_EXEC}|' "$desktop" || true
+        grep -q '^Exec=env {DESKTOP_ENV_FIX} {DESKTOP_EXEC}' "$desktop" || {{
+            echo "ERROR: failed to patch Exec= in $desktop" >&2
+            exit 1
+        }}
+    fi
+done
+"""
 
 
 def is_standard_dir(path: str) -> bool:
@@ -146,7 +223,7 @@ def extract_deb_license(
     # maintainer scripts), e.g. an installer script under /usr/lib. Search
     # the raw data archive bytes rather than extracting to a temp dir.
     result = subprocess.run(
-        ["dpkg-deb", "--fsys-tarfile", deb_path], capture_output=True
+        ["dpkg-deb", "--fsys-tarfile", deb_path], check=False, capture_output=True
     )
     if result.returncode == 0:
         match = re.search(rb"SPDX-License-Identifier:\s*(\S+)", result.stdout)
@@ -175,6 +252,7 @@ def build_requires(control: dict) -> list[str]:
             requires.append(rpm_name)
         else:
             requires.append(f"## unmapped debian dep: {deb_name}")
+    requires.append("qt5-qttools")
     return requires
 
 
@@ -217,7 +295,7 @@ def generate_spec(
 
     version_release = f"{major}.{minor}.{patch}-{release}"
     changelog_date = subprocess.run(
-        ["date", "+%a %b %d %Y"], capture_output=True, text=True
+        ["date", "+%a %b %d %Y"], check=False, capture_output=True, text=True
     ).stdout.strip()
 
     license_line = extract_deb_license(deb_filename, scripts, entries) or "Unspecified"
@@ -271,6 +349,7 @@ fi
         install_copy = "\n".join(f'cp -a "{d}" %{{buildroot}}/' for d in dirs)
 
     files_list = "\n".join(f"/{path}" for path in owned_paths(entries))
+    desktop_fix = desktop_env_fix(entries)
 
     spec_content = f"""Name: {name}
 Version: {major}.{minor}.{patch}
@@ -290,7 +369,7 @@ BuildArch: x86_64
 rm -rf %{{buildroot}}
 mkdir -p %{{buildroot}}
 {install_copy}
-
+{desktop_fix}
 """
 
     if "preinst" in scripts:
@@ -366,8 +445,8 @@ def main():
     parser.add_argument(
         "deb",
         nargs="?",
-        default="Unsloth-Desktop-*-Ubuntu.deb",
-        help="Path to deb package (default: Unsloth-Desktop-*-Ubuntu.deb)",
+        default=None,
+        help="Path to deb package (default: Unsloth-Desktop-Ubuntu.deb, then legacy versioned names)",
     )
     parser.add_argument(
         "-o",
@@ -378,9 +457,17 @@ def main():
 
     args = parser.parse_args()
 
-    deb_files = glob.glob(args.deb)
+    if args.deb is None:
+        deb_files = glob.glob("Unsloth-Desktop-Ubuntu.deb") or sorted(
+            glob.glob("Unsloth-Desktop-*-Ubuntu.deb")
+        )
+    else:
+        deb_files = sorted(glob.glob(args.deb))
     if not deb_files:
-        print(f"No deb files found matching: {args.deb}", file=sys.stderr)
+        pattern = (
+            args.deb or "Unsloth-Desktop-Ubuntu.deb or Unsloth-Desktop-*-Ubuntu.deb"
+        )
+        print(f"No deb files found matching: {pattern}", file=sys.stderr)
         sys.exit(1)
 
     deb_path = deb_files[0]

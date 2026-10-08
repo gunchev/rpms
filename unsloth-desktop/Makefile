@@ -1,4 +1,4 @@
-DEB ?= $(shell ls Unsloth-Desktop-*-Ubuntu.deb 2>/dev/null | head -1)
+DEB ?= $(firstword $(wildcard Unsloth-Desktop-Ubuntu.deb Unsloth-Desktop-*-Ubuntu.deb))
 SPEC ?= unsloth.spec
 RPM_DIR ?= rpms
 BUILD_ROOT := unsloth-buildroot
@@ -23,21 +23,22 @@ help:
 	@echo "  install-deps Install required build dependencies"
 	@echo ""
 	@echo "Variables:"
-	@echo "  DEB          Path to deb package (default: first Unsloth-Desktop-*-Ubuntu.deb)"
+	@echo "  DEB          Path to deb package (default: Unsloth-Desktop-Ubuntu.deb, then legacy versioned names)"
 	@echo "  SPEC         Output spec file path (default: unsloth.spec)"
 	@echo "  RPM_DIR      Directory for RPM output (default: ./rpms/)"
 
 
 
 .PHONY: all
-all: download spec mock
+all: download
+	$(MAKE) mock
 
 
 
 .PHONY: download
 download:
 	@echo "Downloading latest Unsloth Desktop deb package..."
-	@url=$$(curl -sL 'https://api.github.com/repos/unslothai/unsloth/releases/latest' \
+	@url=$$(curl -fsL 'https://api.github.com/repos/unslothai/unsloth/releases/latest' \
 		| grep -o '"browser_download_url": *"[^"]*-Ubuntu\.deb"' \
 		| head -1 | sed 's/.*"\(https:[^"]*\)"/\1/'); \
 	if [ -z "$$url" ]; then \
@@ -45,7 +46,12 @@ download:
 		exit 1; \
 	fi; \
 	echo "Downloading: $$url"; \
-	curl -C - -L -O "$$url"
+	file=$${url##*/}; \
+	if ! curl -fL -o "$$file.part" "$$url"; then \
+		rm -f -- "$$file.part"; \
+		exit 1; \
+	fi; \
+	mv -f -- "$$file.part" "$$file"
 	@echo "Download complete"
 
 
@@ -64,13 +70,13 @@ rpm: spec
 
 
 .PHONY: sources
-sources:
+sources: spec
 	@spectool -g -S ./*.spec
 
 
 
 .PHONY: mock
-mock: spec sources
+mock: sources
 	@echo "Building SRPM with mock..."
 	mkdir -p "$(RPM_DIR)"
 	mock --buildsrpm --sources=./ --spec ./*.spec --resultdir="$(RPM_DIR)/"

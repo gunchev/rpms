@@ -1,6 +1,7 @@
 # Build artifacts
 *.rpm
 *.deb
+*.deb.part
 *.spec
 /rpms/
 
