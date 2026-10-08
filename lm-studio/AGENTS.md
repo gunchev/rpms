@@ -243,11 +243,63 @@ sudo zypper install rpm-build dpkg mock
 
 | Location | Function | Purpose |
 |----------|----------|---------|
-| `gen_spec.py:11` | `extract_deb_control()` | Extract package metadata from deb control file |
-| `gen_spec.py:31` | `extract_deb_scripts()` | Extract pre/post install scripts |
-| `gen_spec.py:42` | `parse_version()` | Parse semantic version string to tuple |
-| `gen_spec.py:52` | `generate_spec()` | Generate complete RPM spec content |
+| `gen_spec.py:14` | `extract_deb_control()` | Extract package metadata from deb control file |
+| `gen_spec.py:53` | `list_deb_data_entries()` | List `(install path, size)` pairs from the deb data archive |
+| `gen_spec.py:88` | `list_deb_data_paths()` | List absolute install paths from the deb data archive |
+| `gen_spec.py:93` | `extract_deb_md5sums()` | Read the deb's own `md5sums` manifest |
+| `gen_spec.py:126` | `find_duplicate_groups()` | Group byte-identical files for hardlinking |
+| `gen_spec.py:149` | `build_install_snippet()` | Emit `%install` lms symlink + hardlink commands |
+| `gen_spec.py:187` | `build_files_entries()` | Build the `%files` list from discovered deb paths |
+| `gen_spec.py:219` | `extract_deb_scripts()` | Extract pre/post install scripts |
+| `gen_spec.py:234` | `parse_version()` | Parse semantic version string to tuple |
+| `gen_spec.py:257` | `generate_spec()` | Generate complete RPM spec content |
 | `Makefile:71` | `mock` target | Build SRPM and RPM using mock |
+
+Do not hardcode desktop/icon paths in the spec — `generate_spec()` derives them from
+`list_deb_data_paths()` so upstream layout changes do not break the build.
+
+### Bundled `lms` CLI
+
+`%install` creates a relative symlink `/usr/bin/lms` -> `../../opt/LM-Studio/resources/app/.webpack/lms`
+and owns it in `%files`. It is only generated when `LMS_CLI_PATH` exists in the deb, so an
+upstream layout change cannot break the build. Verify with `lms --version` (prints
+`CLI commit: <sha>`).
+
+### In-app updater removed
+
+The deb ships `opt/LM-Studio/resources/app-update.yml` (electron-builder updater config:
+`provider: s3`, bucket `lmstudio-updaters`) plus `resources/package-type` (`deb`).
+`%install` deletes `app-update.yml` (`UPDATER_CONFIG_PATH`) so the RPM-installed app cannot
+offer in-app updates. Why this matters:
+
+- The updater escalates via sudo/pkexec — `main/index.js` carries
+  `'Running as non-root user, using sudo to install: '` + `SCRIPT_DATA` and `pkexec` /
+  `gksudo` / `kdesudo` helpers — so it writes into the root-owned `/opt/LM-Studio`.
+- It renames the outgoing files instead of removing them, leaving
+  `"<file>;<hex unix ts>"` rollback copies. On a live host one update pass at
+  `0x69ffad4d` = 2026-05-10 00:55:25 left 91 files / 684 MB behind, 73 of them
+  byte-identical to the new version (Electron runtime assets that do not change between
+  releases). `rpm -U` does not clean them because no package owns them.
+- `resources/package-type` is left as-is; it is inert once the config is gone.
+
+If a future build surfaces an "update check failed" toast, the config delete is too blunt —
+patch the `checkForUpdates` call site in `main/index.js` instead.
+
+### Hardlink dedup
+
+`find_duplicate_groups()` uses the deb's own `md5sums` manifest (no re-hashing) to find
+byte-identical files at different paths and emits `ln -f "$BR<src>" "$BR<dup>"` into
+`%install`; RPM stores one copy and reinstalls them as hardlinks. Only files >=
+`MIN_HARDLINK_BYTES` (16 KiB) qualify. In 0.4.25 that is 11 groups / 24.1 MB, mostly the
+llama.cpp libs duplicated between the `avx2` and `vulkan` backend dirs. Verify after a build:
+
+```bash
+rpm2cpio ~/rpmbuild/RPMS/x86_64/lm-studio-*.rpm | cpio -idm --quiet
+stat -c '%i %h %n' \
+  opt/LM-Studio/resources/app/.webpack/bin/extensions/backends/llama.cpp-linux-x86_64-avx2-2.41.0/libllama.so \
+  opt/LM-Studio/resources/app/.webpack/bin/extensions/backends/llama.cpp-linux-x86_64-vulkan-avx2-2.41.0/libllama.so
+# both lines must show the same inode with links=2
+```
 
 ## Troubleshooting
 
@@ -260,7 +312,16 @@ ls -la LM-Studio-*.deb
 
 **RPM build fails with unpackaged files**: The `_unpackaged_files_terminate_build` macro is set to 0 to allow this, but verify `%files` section lists all needed paths.
 
-**Icon directory issue**: The build script automatically fixes the `0x0` icon directory (should be `1024x1024`).
+**Icon directory issue**: `%prep` still renames the legacy `0x0` icon directory to `1024x1024`
+when present (pre-0.4.25 debs). Since 0.4.25 the deb ships a proper hicolor set
+(16x16 … 512x512) and the desktop file is `ai.elementlabs.lmstudio.desktop`, not
+`lm-studio.desktop`; both are picked up automatically by `build_files_entries()`.
+
+**`<file>;69ffad4d` copies are not package files**: LM Studio's own runtime updater renames
+the previous version's files with a `;<hex>` suffix and leaves them under `/opt/LM-Studio`.
+They show up in `sha1sum` output and eat disk (on a live 0.4.25 install 73 of them,
+391 MB, were byte-identical to their base file) but they are absent from the deb, so the
+spec cannot hardlink them. Dedupe them on the host, not in the package.
 
 **Permission denied**: Ensure write permissions to the output directory.
 
